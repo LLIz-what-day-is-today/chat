@@ -52,8 +52,22 @@ header {
 }
 #title { font-size: 16px; font-weight: 600; overflow: hidden;
          text-overflow: ellipsis; white-space: nowrap; }
-#status { flex: none; margin-left: 10px; font-size: 12px; color: #999; }
+#status {
+  flex: none; margin-left: 10px; padding: 6px 10px;
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: #666;
+  border-radius: 14px; cursor: pointer; user-select: none;
+  background: #fff; border: 1px solid #e2e2e2;
+}
+#status:active { background: #f0f0f0; }
 #status.on { color: #07c160; }
+#status.off { color: #e64340; }
+#statusDot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #ccc; flex: none;
+}
+#status.on #statusDot { background: #07c160; }
+#status.off #statusDot { background: #e64340; }
 
 #msgs {
   flex: 1 1 auto; overflow-y: auto; padding: 12px 12px 4px;
@@ -102,6 +116,49 @@ header {
 }
 #sendBtn:active, #fileBtn:active { opacity: .8; }
 
+/* ---------- 侧边栏 ---------- */
+#mask {
+  position: fixed; inset: 0; z-index: 55;
+  background: rgba(0,0,0,.35);
+  opacity: 0; pointer-events: none;
+  transition: opacity .25s ease;
+}
+#mask.open { opacity: 1; pointer-events: auto; }
+
+#sidebar {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: 260px; max-width: 78vw;
+  z-index: 60;
+  background: #fff;
+  transform: translateX(100%);
+  transition: transform .25s ease;
+  box-shadow: -2px 0 14px rgba(0,0,0,.12);
+  display: flex; flex-direction: column;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+#sidebar.open { transform: translateX(0); }
+
+.sb-head {
+  flex: none; padding: 16px 20px 12px;
+  font-size: 15px; font-weight: 600; color: #333;
+}
+.sb-head span { color: #07c160; }
+.sb-line { flex: none; height: 1px; background: #eee; margin: 0 16px; }
+#peerList {
+  flex: 1 1 auto; overflow-y: auto; padding: 8px 0;
+  -webkit-overflow-scrolling: touch;
+}
+.peer {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 20px; font-size: 15px; color: #333;
+}
+.peer .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #07c160; flex: none;
+}
+.peer.me { color: #07c160; font-weight: 500; }
+.peer.me .dot { background: #07c160; box-shadow: 0 0 0 3px rgba(7,193,96,.15); }
+
 .lightbox {
   position: fixed; inset: 0; z-index: 100; padding: 16px;
   background: rgba(0,0,0,.9);
@@ -125,7 +182,10 @@ header {
 <div id="app" hidden>
   <header>
     <div id="title">聊天室</div>
-    <div id="status">连接中…</div>
+    <div id="status">
+      <span id="statusDot"></span>
+      <span id="statusText">连接中</span>
+    </div>
   </header>
   <div id="msgs"></div>
   <div id="bar">
@@ -136,16 +196,25 @@ header {
   <input type="file" id="fileInput" hidden multiple>
 </div>
 
+<div id="mask"></div>
+<div id="sidebar">
+  <div class="sb-head">在线人数: <span id="onlineCount">0</span></div>
+  <div class="sb-line"></div>
+  <div id="peerList"></div>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 (function () {
   'use strict';
 
   /* ============ 配置 ============ */
-  var BROKER    = 'wss://broker.emqx.io:8084/mqtt';   // 公共 MQTT 服务器
-  var TOPIC     = 'ghchat/room/v1/8f2c1a';            // 想换房间就改这里
-  var MAX_FILE  = 5 * 1024 * 1024;                    // 单文件上限 5MB
-  var CHUNK     = 80000;                              // 分片大小（字符）
+  var BROKER        = 'wss://broker.emqx.io:8084/mqtt';
+  var TOPIC         = 'ghchat/room/v1/8f2c1a';   // 想换房间就改这里
+  var MAX_FILE      = 5 * 1024 * 1024;
+  var CHUNK         = 80000;
+  var HEARTBEAT_MS  = 15000;   // 心跳间隔
+  var PEER_TIMEOUT  = 45000;   // 超过这个时间没心跳就认为掉线
 
   /* ============ 工具 ============ */
   var $ = function (id) { return document.getElementById(id); };
@@ -175,8 +244,9 @@ header {
   var username  = '';
   var client    = null;
   var connected = false;
-  var seen      = Object.create(null);   // 已处理消息 id
-  var incoming  = Object.create(null);   // 正在接收的文件
+  var seen      = Object.create(null);
+  var incoming  = Object.create(null);
+  var peers     = Object.create(null);   // username -> lastSeen 时间戳
 
   /* ============ 登录 ============ */
   $('uname').value = store('chat_username') || '';
@@ -196,19 +266,21 @@ header {
     $('login').style.display = 'none';
     $('app').hidden = false;
     $('title').textContent = '聊天室 · ' + username;
+    // 自己先加入在线列表
+    peers[username] = Date.now();
+    renderPeers();
     loadHistory();
     connect();
   }
 
   /* ============ 连接 ============ */
-  function setStatus(s, on) {
-    var el = $('status');
-    el.textContent = s;
-    el.className = on ? 'on' : '';
+  function setStatus(text, cls) {
+    $('statusText').textContent = text;
+    $('status').className = cls || '';
   }
 
   function connect() {
-    if (typeof mqtt === 'undefined') { setStatus('无法加载通信库'); return; }
+    if (typeof mqtt === 'undefined') { setStatus('通信库加载失败', 'off'); return; }
     try {
       client = mqtt.connect(BROKER, {
         clientId: 'web_' + Math.random().toString(16).slice(2, 10),
@@ -217,16 +289,22 @@ header {
         reconnectPeriod: 3000,
         connectTimeout: 15000
       });
-    } catch (e) { setStatus('连接失败'); return; }
+    } catch (e) { setStatus('连接失败', 'off'); return; }
 
     client.on('connect', function () {
       connected = true;
-      setStatus('在线', true);
       client.subscribe(TOPIC, { qos: 0 });
+      // 宣布上线，并主动请求一次他人的心跳
+      publish({ t: 'join', user: username, time: Date.now() });
+      publish({ t: 'who',  user: username, time: Date.now() });
+      startHeartbeat();
     });
     client.on('reconnect', function () { setStatus('连接中…'); });
-    client.on('close',     function () { connected = false; setStatus('离线'); });
-    client.on('error',     function () { setStatus('连接出错'); });
+    client.on('close',     function () {
+      connected = false;
+      setStatus('离线', 'off');
+    });
+    client.on('error',     function () { setStatus('连接出错', 'off'); });
     client.on('message',   function (topic, payload) {
       var m;
       try { m = JSON.parse(payload.toString()); } catch (e) { return; }
@@ -240,8 +318,93 @@ header {
     catch (e) { return false; }
   }
 
+  /* ============ 心跳 / 在线列表 ============ */
+  var hbTimer = null, cleanTimer = null;
+
+  function startHeartbeat() {
+    if (hbTimer) clearInterval(hbTimer);
+    if (cleanTimer) clearInterval(cleanTimer);
+    hbTimer = setInterval(function () {
+      publish({ t: 'heartbeat', user: username, time: Date.now() });
+    }, HEARTBEAT_MS);
+    cleanTimer = setInterval(function () {
+      var now = Date.now(), changed = false;
+      Object.keys(peers).forEach(function (u) {
+        if (u === username) return;
+        if (now - peers[u] > PEER_TIMEOUT) { delete peers[u]; changed = true; }
+      });
+      if (changed) renderPeers();
+    }, 5000);
+  }
+
+  function touchPeer(name) {
+    if (!name) return false;
+    var existed = !!peers[name];
+    peers[name] = Date.now();
+    if (!existed) renderPeers();
+    return !existed;
+  }
+
+  function dropPeer(name) {
+    if (peers[name] && name !== username) {
+      delete peers[name];
+      renderPeers();
+    }
+  }
+
+  function renderPeers() {
+    var list = Object.keys(peers);
+    // 自己排最前
+    list.sort(function (a, b) {
+      if (a === username) return -1;
+      if (b === username) return 1;
+      return a.localeCompare(b, 'zh');
+    });
+
+    $('onlineCount').textContent = list.length;
+
+    var box = $('peerList');
+    box.innerHTML = '';
+    list.forEach(function (u) {
+      var d = document.createElement('div');
+      d.className = 'peer' + (u === username ? ' me' : '');
+      var dot = document.createElement('span');
+      dot.className = 'dot';
+      d.appendChild(dot);
+      var txt = document.createElement('span');
+      txt.textContent = u + (u === username ? '（我）' : '');
+      d.appendChild(txt);
+      box.appendChild(d);
+    });
+
+    // header 上的状态文本同步显示在线人数
+    if (connected) setStatus('在线 ' + list.length, 'on');
+  }
+
   /* ============ 收消息 ============ */
   function onMessage(m) {
+    /* ---- 在线状态 ---- */
+    if (m.t === 'join' || m.t === 'heartbeat') {
+      if (m.user === username) return;
+      touchPeer(m.user);
+      // 收到别人的 join，回一个心跳让对方知道自己
+      if (m.t === 'join') {
+        publish({ t: 'heartbeat', user: username, time: Date.now() });
+      }
+      return;
+    }
+    if (m.t === 'who') {
+      if (m.user === username) return;
+      publish({ t: 'heartbeat', user: username, time: Date.now() });
+      return;
+    }
+    if (m.t === 'leave') {
+      if (m.user === username) return;
+      dropPeer(m.user);
+      return;
+    }
+
+    /* ---- 聊天消息 ---- */
     if (m.t === 'msg') {
       if (seen[m.id]) return;
       seen[m.id] = 1;
@@ -265,7 +428,7 @@ header {
       var g = incoming[m.id];
       if (!g) return;
       delete incoming[m.id];
-      if (g.got !== g.meta.n) return;      // 不完整，丢弃
+      if (g.got !== g.meta.n) return;
       var meta = g.meta;
       meta.data = g.parts.join('');
       render(meta);
@@ -273,7 +436,7 @@ header {
     }
   }
 
-  /* ============ 渲染 ============ */
+  /* ============ 渲染消息 ============ */
   function render(m) {
     var msgs = $('msgs');
 
@@ -338,7 +501,7 @@ header {
     document.body.appendChild(d);
   }
 
-  /* ============ 本地历史（按用户名保存） ============ */
+  /* ============ 本地历史 ============ */
   function histKey() { return 'chat_history_' + username; }
 
   function saveText(m) {
@@ -365,7 +528,7 @@ header {
     var el = $('input');
     var text = el.value.trim();
     if (!text) return;
-    if (!connected) { setStatus('未连接'); return; }
+    if (!connected) { setStatus('未连接', 'off'); return; }
 
     var m = {
       t: 'msg', id: uid(), user: username, time: Date.now(),
@@ -401,7 +564,6 @@ header {
       var id = uid();
       var n  = Math.ceil(dataUrl.length / CHUNK) || 1;
 
-      // 本地先显示
       var local = {
         t: 'fstart', id: id, user: username, time: Date.now(),
         name: file.name, size: file.size, mime: type, kind: kind,
@@ -410,7 +572,6 @@ header {
       seen[id] = 1;
       render(local);
 
-      // 广播
       publish({
         t: 'fstart', id: id, user: username, time: local.time,
         name: file.name, size: file.size, mime: type, kind: kind, n: n
@@ -453,6 +614,111 @@ header {
 
   window.addEventListener('resize', function () {
     $('msgs').scrollTop = $('msgs').scrollHeight;
+  });
+
+  /* ============ 侧边栏：点击 + 手势 ============ */
+  var sidebar = $('sidebar');
+  var mask    = $('mask');
+
+  function openSidebar() {
+    sidebar.style.transition = '';
+    sidebar.style.transform = '';
+    mask.style.transition = '';
+    mask.style.opacity = '';
+    sidebar.classList.add('open');
+    mask.classList.add('open');
+  }
+  function closeSidebar() {
+    sidebar.style.transition = '';
+    sidebar.style.transform = '';
+    mask.style.transition = '';
+    mask.style.opacity = '';
+    sidebar.classList.remove('open');
+    mask.classList.remove('open');
+  }
+
+  // 点击 header 上的在线状态打开
+  $('status').addEventListener('click', function () {
+    if (sidebar.classList.contains('open')) closeSidebar();
+    else openSidebar();
+  });
+
+  // 点击遮罩关闭
+  mask.addEventListener('click', closeSidebar);
+
+  /* --- 手势：从右边缘往左划 --- */
+  var dragging = false, startX = 0, startY = 0, sbWidth = 0;
+
+  document.addEventListener('touchstart', function (e) {
+    if (sidebar.classList.contains('open')) return;   // 打开状态下不接管
+    var t = e.touches[0];
+    if (t.clientX >= window.innerWidth - 40) {        // 右边缘 40px 内
+      dragging = true;
+      startX = t.clientX;
+      startY = t.clientY;
+      sbWidth = sidebar.offsetWidth;
+    }
+  }, { passive: true });
+
+  document.addEventListener('touchmove', function (e) {
+    if (!dragging) return;
+    var t = e.touches[0];
+    var dx = t.clientX - startX;
+    var dy = t.clientY - startY;
+
+    // 判定为纵向滚动则放弃手势
+    if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 20) {
+      dragging = false;
+      sidebar.style.transition = '';
+      sidebar.style.transform = '';
+      mask.style.transition = '';
+      mask.style.opacity = '';
+      return;
+    }
+    if (dx > 0) return;   // 只响应向左滑
+
+    var pos = Math.max(0, Math.min(sbWidth, sbWidth + dx));
+    sidebar.style.transition = 'none';
+    sidebar.style.transform = 'translateX(' + pos + 'px)';
+    mask.style.transition = 'none';
+    mask.style.opacity = String(1 - pos / sbWidth);
+  }, { passive: true });
+
+  document.addEventListener('touchend', function (e) {
+    if (!dragging) return;
+    dragging = false;
+    var dx = e.changedTouches[0].clientX - startX;
+
+    // 恢复 transition，然后让 class 接管
+    sidebar.style.transition = '';
+    mask.style.transition = '';
+    void sidebar.offsetWidth;   // 强制 reflow，保证过渡生效
+    sidebar.style.transform = '';
+    mask.style.opacity = '';
+
+    if (dx < -sbWidth / 3) {
+      sidebar.classList.add('open');
+      mask.classList.add('open');
+    } else {
+      sidebar.classList.remove('open');
+      mask.classList.remove('open');
+    }
+  }, { passive: true });
+
+  document.addEventListener('touchcancel', function () {
+    if (!dragging) return;
+    dragging = false;
+    sidebar.style.transition = '';
+    sidebar.style.transform = '';
+    mask.style.transition = '';
+    mask.style.opacity = '';
+    sidebar.classList.remove('open');
+    mask.classList.remove('open');
+  }, { passive: true });
+
+  /* ============ 离开时广播 ============ */
+  window.addEventListener('beforeunload', function () {
+    publish({ t: 'leave', user: username });
   });
 
 })();
