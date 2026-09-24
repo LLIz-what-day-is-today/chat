@@ -53,15 +53,13 @@ header {
 #title { font-size: 16px; font-weight: 600; overflow: hidden;
          text-overflow: ellipsis; white-space: nowrap; }
 #status {
-  flex: none; margin-left: 10px; padding: 6px 10px;
+  flex: none; margin-left: 10px; padding: 6px 12px;
   display: flex; align-items: center; gap: 6px;
-  font-size: 13px; color: #666;
+  font-size: 14px; color: #333;
   border-radius: 14px; cursor: pointer; user-select: none;
   background: #fff; border: 1px solid #e2e2e2;
 }
 #status:active { background: #f0f0f0; }
-#status.on { color: #07c160; }
-#status.off { color: #e64340; }
 #statusDot {
   width: 8px; height: 8px; border-radius: 50%;
   background: #ccc; flex: none;
@@ -184,7 +182,7 @@ header {
     <div id="title">聊天室</div>
     <div id="status">
       <span id="statusDot"></span>
-      <span id="statusText">连接中</span>
+      <span id="statusText">0</span>
     </div>
   </header>
   <div id="msgs"></div>
@@ -213,8 +211,8 @@ header {
   var TOPIC         = 'ghchat/room/v1/8f2c1a';   // 想换房间就改这里
   var MAX_FILE      = 5 * 1024 * 1024;
   var CHUNK         = 80000;
-  var HEARTBEAT_MS  = 15000;   // 心跳间隔
-  var PEER_TIMEOUT  = 45000;   // 超过这个时间没心跳就认为掉线
+  var HEARTBEAT_MS  = 15000;
+  var PEER_TIMEOUT  = 45000;
 
   /* ============ 工具 ============ */
   var $ = function (id) { return document.getElementById(id); };
@@ -246,7 +244,7 @@ header {
   var connected = false;
   var seen      = Object.create(null);
   var incoming  = Object.create(null);
-  var peers     = Object.create(null);   // username -> lastSeen 时间戳
+  var peers     = Object.create(null);
 
   /* ============ 登录 ============ */
   $('uname').value = store('chat_username') || '';
@@ -266,7 +264,6 @@ header {
     $('login').style.display = 'none';
     $('app').hidden = false;
     $('title').textContent = '聊天室 · ' + username;
-    // 自己先加入在线列表
     peers[username] = Date.now();
     renderPeers();
     loadHistory();
@@ -274,38 +271,42 @@ header {
   }
 
   /* ============ 连接 ============ */
-  function setStatus(text, cls) {
-    $('statusText').textContent = text;
-    $('status').className = cls || '';
-  }
-
   function connect() {
-    if (typeof mqtt === 'undefined') { setStatus('通信库加载失败', 'off'); return; }
+    if (typeof mqtt === 'undefined') {
+      console.error('[chat] mqtt.min.js 未加载');
+      return;
+    }
     try {
       client = mqtt.connect(BROKER, {
         clientId: 'web_' + Math.random().toString(16).slice(2, 10),
         clean: true,
         keepalive: 30,
         reconnectPeriod: 3000,
-        connectTimeout: 15000
+        connectTimeout: 10000
       });
-    } catch (e) { setStatus('连接失败', 'off'); return; }
+    } catch (e) {
+      console.error('[chat] connect 异常', e);
+      return;
+    }
 
     client.on('connect', function () {
       connected = true;
+      console.log('[chat] 已连接');
       client.subscribe(TOPIC, { qos: 0 });
-      // 宣布上线，并主动请求一次他人的心跳
       publish({ t: 'join', user: username, time: Date.now() });
       publish({ t: 'who',  user: username, time: Date.now() });
       startHeartbeat();
+      renderPeers();
     });
-    client.on('reconnect', function () { setStatus('连接中…'); });
-    client.on('close',     function () {
+
+    client.on('close', function () {
       connected = false;
-      setStatus('离线', 'off');
+      renderPeers();
     });
-    client.on('error',     function () { setStatus('连接出错', 'off'); });
-    client.on('message',   function (topic, payload) {
+    client.on('error', function (err) {
+      console.error('[chat] 错误', err);
+    });
+    client.on('message', function (topic, payload) {
       var m;
       try { m = JSON.parse(payload.toString()); } catch (e) { return; }
       onMessage(m);
@@ -338,11 +339,10 @@ header {
   }
 
   function touchPeer(name) {
-    if (!name) return false;
+    if (!name) return;
     var existed = !!peers[name];
     peers[name] = Date.now();
     if (!existed) renderPeers();
-    return !existed;
   }
 
   function dropPeer(name) {
@@ -354,7 +354,6 @@ header {
 
   function renderPeers() {
     var list = Object.keys(peers);
-    // 自己排最前
     list.sort(function (a, b) {
       if (a === username) return -1;
       if (b === username) return 1;
@@ -362,6 +361,8 @@ header {
     });
 
     $('onlineCount').textContent = list.length;
+    $('statusText').textContent  = list.length;
+    $('status').className = connected ? 'on' : 'off';
 
     var box = $('peerList');
     box.innerHTML = '';
@@ -376,18 +377,13 @@ header {
       d.appendChild(txt);
       box.appendChild(d);
     });
-
-    // header 上的状态文本同步显示在线人数
-    if (connected) setStatus('在线 ' + list.length, 'on');
   }
 
   /* ============ 收消息 ============ */
   function onMessage(m) {
-    /* ---- 在线状态 ---- */
     if (m.t === 'join' || m.t === 'heartbeat') {
       if (m.user === username) return;
       touchPeer(m.user);
-      // 收到别人的 join，回一个心跳让对方知道自己
       if (m.t === 'join') {
         publish({ t: 'heartbeat', user: username, time: Date.now() });
       }
@@ -404,7 +400,6 @@ header {
       return;
     }
 
-    /* ---- 聊天消息 ---- */
     if (m.t === 'msg') {
       if (seen[m.id]) return;
       seen[m.id] = 1;
@@ -528,7 +523,7 @@ header {
     var el = $('input');
     var text = el.value.trim();
     if (!text) return;
-    if (!connected) { setStatus('未连接', 'off'); return; }
+    if (!connected) return;
 
     var m = {
       t: 'msg', id: uid(), user: username, time: Date.now(),
@@ -637,22 +632,20 @@ header {
     mask.classList.remove('open');
   }
 
-  // 点击 header 上的在线状态打开
   $('status').addEventListener('click', function () {
     if (sidebar.classList.contains('open')) closeSidebar();
     else openSidebar();
   });
 
-  // 点击遮罩关闭
   mask.addEventListener('click', closeSidebar);
 
   /* --- 手势：从右边缘往左划 --- */
   var dragging = false, startX = 0, startY = 0, sbWidth = 0;
 
   document.addEventListener('touchstart', function (e) {
-    if (sidebar.classList.contains('open')) return;   // 打开状态下不接管
+    if (sidebar.classList.contains('open')) return;
     var t = e.touches[0];
-    if (t.clientX >= window.innerWidth - 40) {        // 右边缘 40px 内
+    if (t.clientX >= window.innerWidth - 40) {
       dragging = true;
       startX = t.clientX;
       startY = t.clientY;
@@ -666,7 +659,6 @@ header {
     var dx = t.clientX - startX;
     var dy = t.clientY - startY;
 
-    // 判定为纵向滚动则放弃手势
     if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 20) {
       dragging = false;
       sidebar.style.transition = '';
@@ -675,7 +667,7 @@ header {
       mask.style.opacity = '';
       return;
     }
-    if (dx > 0) return;   // 只响应向左滑
+    if (dx > 0) return;
 
     var pos = Math.max(0, Math.min(sbWidth, sbWidth + dx));
     sidebar.style.transition = 'none';
@@ -689,10 +681,9 @@ header {
     dragging = false;
     var dx = e.changedTouches[0].clientX - startX;
 
-    // 恢复 transition，然后让 class 接管
     sidebar.style.transition = '';
     mask.style.transition = '';
-    void sidebar.offsetWidth;   // 强制 reflow，保证过渡生效
+    void sidebar.offsetWidth;
     sidebar.style.transform = '';
     mask.style.opacity = '';
 
